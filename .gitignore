@@ -1,0 +1,39 @@
+# ==========================================
+# LARGE BINARY & ALIGNMENT FILES (BAM / BAI)
+# ==========================================
+*.bam
+*.bam.bai
+*.fa
+*.fasta
+
+# ==========================================
+# INTERMEDIATE & PROCESSED GENOMIC BED FILES
+# ==========================================
+*.bed
+*.bedgraph
+
+# ==========================================
+# DATA TABLES, TSVS, AND INTERMEDIATE EXPORTS
+# ==========================================
+*.tsv
+*.csv
+!*config*.csv  # (Uncomment if you have a tracked config file)
+
+# ==========================================
+# LOG FILES
+# ==========================================
+*.log
+
+# ==========================================
+# PYTHON & JUPYTER NOTEBOOK CHECKPOINTS
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# ==========================================
+# OPEROSYSTEM FILES
+# ==========================================
+.DS_Store
+Thumbs.db
