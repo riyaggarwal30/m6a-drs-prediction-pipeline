@@ -66,7 +66,6 @@ Errors on the test set (8,569 m6A sites, 4,548 unmodified sites):
 
 Most of Model 1's errors (96%) are fixed by Models 2 and 3. Most of Model 2's errors (82%) are also made by Model 3, so adding features barely helps once the probabilities are in.
 
-![ROC and PR curves](results/figures/roc_pr_curves.png)
 
 ### Where Model 2 goes wrong
 
