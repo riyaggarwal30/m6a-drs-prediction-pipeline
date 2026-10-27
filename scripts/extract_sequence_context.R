@@ -1,29 +1,37 @@
----
-title: "seq context"
-output: html_document
-date: "2026-10-10"
----
+library(BSgenome)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomicRanges)
+library(tidyverse)
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
+# 1. Read exported master dataframe from Python
+df <- read_tsv("master_df_temp.tsv")
 
-## R Markdown
+# 2. Construct 1-based GRanges window [start - 2, start + 2]
+gr <- GRanges(
+  seqnames = df$chrom,
+  ranges = IRanges(start = df$start - 2, end = df$start + 2),
+  strand = df$strand
+)
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+# 3. Extract 5-mer sequences (handles reverse complement for '-' strand automatically)
+hg38 <- BSgenome.Hsapiens.UCSC.hg38
+df$kmer_5mer <- as.character(getSeq(hg38, gr))
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+# 4. Extract position-specific columns (-2, -1, +1, +2)
+df$pos_minus2 <- substr(df$kmer_5mer, 1, 1)
+df$pos_minus1 <- substr(df$kmer_5mer, 2, 2)
+# Index 3 is central Adenosine ('A')
+df$pos_plus1  <- substr(df$kmer_5mer, 4, 4)
+df$pos_plus2  <- substr(df$kmer_5mer, 5, 5)
 
-```{r cars}
-summary(cars)
-```
+# 5. Sanity check: Ensure central base (Index 3) is always 'A'
+central_bases <- unique(substr(df$kmer_5mer, 3, 3))
+cat("Central target bases found:", central_bases, "\n")
+stopifnot(all(central_bases == "A"))
 
-## Including Plots
+# 6. Save complete feature dataset
+write_tsv(df, "final_m6a_feature_matrix.tsv")
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+cat("\n--- Sequence Context Extraction Complete! ---\n")
+cat("Dimensions:", dim(df), "\n")
+print(head(df[, c("chrom", "start", "strand", "kmer_5mer", "pos_minus2", "pos_minus1", "pos_plus1", "pos_plus2")]))
