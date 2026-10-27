@@ -1,0 +1,28 @@
+name: m6a-drs
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # command-line tools
+  - samtools=1.21
+  - ont-modkit=0.4.2
+
+  # Python (for the notebooks)
+  - python=3.11
+  - pandas
+  - numpy
+  - jupyter
+
+  # R and packages
+  - r-base=4.3
+  - r-tidyverse
+  - r-data.table
+  - r-xgboost
+  - r-proc
+  - r-prroc
+  - r-patchwork
+  - r-here
+  - r-rmarkdown
+  - r-knitr
+  - bioconductor-biostrings
+  - bioconductor-bsgenome.hsapiens.ucsc.hg38
