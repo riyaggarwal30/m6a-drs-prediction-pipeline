@@ -1,0 +1,250 @@
+---
+title: "model2"
+output: html_document
+date: "2026-10-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#loading the packages
+library(xgboost)
+library(pROC)
+library(caret)
+library(tidyverse)
+library(PRROC)
+
+#loading the training and testing datasets
+library(data.table)
+train_val_df <- as.data.frame(fread("final_train_set_model2.tsv"))
+test_df      <- as.data.frame(fread("final_test_set_model2_fixed.tsv"))
+
+
+exclude_cols <- c("target") # Only exclude the target label column
+# Separate features (X) and target label (y)
+X_train_val <- train_val_df %>% select(-all_of(exclude_cols)) %>% as.matrix()
+y_train_val <- train_val_df$target
+
+X_test <- test_df %>% select(-all_of(exclude_cols)) %>% as.matrix()
+y_test <- test_df$target
+
+stopifnot(is.numeric(X_train_val), identical(colnames(X_train_val), colnames(X_test)))
+
+dtrain_val <- xgb.DMatrix(X_train_val, label = y_train_val)
+dtest      <- xgb.DMatrix(X_test,      label = y_test)
+
+chrom_ids <- fread("train_val_ids.csv")$chrom          # same row order as train_val.csv
+stopifnot(length(chrom_ids) == nrow(X_train_val))
+```
+
+
+```{r}
+#5-fold cross validation
+set.seed(42)
+chroms        <- unique(chrom_ids)
+fold_of_chrom <- sample(rep(1:5, length.out = length(chroms)))
+folds <- lapply(1:5, function(k) which(chrom_ids %in% chroms[fold_of_chrom == k]))
+print(sapply(folds, length))   # check sizes are roughly balanced; change the seed if one fold is huge
+
+
+fold_balance <- data.frame(
+  fold = 1:5,
+  n    = sapply(folds, length),
+  pos  = sapply(folds, function(idx) sum(y_train_val[idx] == 1)),
+  neg  = sapply(folds, function(idx) sum(y_train_val[idx] == 0))
+)
+fold_balance$pos_frac <- round(fold_balance$pos / fold_balance$n, 3)
+print(fold_balance)
+
+# Build the fold DMatrices once (they don't change between grid rows)
+fold_data <- lapply(folds, function(val_idx) {
+  train_idx <- setdiff(seq_len(nrow(X_train_val)), val_idx)
+  list(
+    dtrain  = xgb.DMatrix(X_train_val[train_idx, ], label = y_train_val[train_idx]),
+    dval    = xgb.DMatrix(X_train_val[val_idx, ],   label = y_train_val[val_idx]),
+    actuals = y_train_val[val_idx]
+  )
+})
+
+# 1. Hyperparameter grid (nrounds is evaluated inside, not a grid axis)
+hyper_grid <- expand.grid(
+  max_depth        = c(3, 4, 6),
+  eta              = c(0.01, 0.05, 0.10),
+  min_child_weight = c(1, 5)
+)
+nrounds_set <- c(100, 200, 400, 600)
+max_rounds  <- max(nrounds_set)
+
+cat(sprintf("--- Grid search: %d combinations x %d round counts, 5 chromosome-grouped folds ---\n\n",
+            nrow(hyper_grid), length(nrounds_set)))
+
+# 2. Grid search
+results <- list()
+
+for (g in seq_len(nrow(hyper_grid))) {
+
+  params_curr <- list(
+    objective        = "binary:logistic",
+    eval_metric      = "logloss",
+    max_depth        = hyper_grid$max_depth[g],
+    eta              = hyper_grid$eta[g],
+    min_child_weight = hyper_grid$min_child_weight[g],
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+    seed             = 42
+  )
+
+  # metrics[round_idx, fold]
+  roc_m <- pr_m <- matrix(NA_real_, nrow = length(nrounds_set), ncol = 5)
+
+  for (i in 1:5) {
+    fd <- fold_data[[i]]
+
+    # Train ONCE per fold at the maximum number of rounds
+    model_fold <- xgb.train(params = params_curr, data = fd$dtrain,
+                            nrounds = max_rounds, verbose = 0)
+
+    # Score the same model at each smaller round count
+    for (r in seq_along(nrounds_set)) {
+      nr        <- nrounds_set[r]
+      val_probs <- predict(model_fold, fd$dval, iterationrange = c(1, nr))
+
+      roc_m[r, i] <- as.numeric(auc(roc(fd$actuals, val_probs,
+                                        levels = c(0, 1), direction = "<", quiet = TRUE)))
+      pr_m[r, i]  <- pr.curve(scores.class0 = val_probs[fd$actuals == 1],
+                              scores.class1 = val_probs[fd$actuals == 0])$auc.integral
+    }
+  }
+
+  for (r in seq_along(nrounds_set)) {
+    results[[length(results) + 1]] <- data.frame(
+      max_depth        = hyper_grid$max_depth[g],
+      eta              = hyper_grid$eta[g],
+      min_child_weight = hyper_grid$min_child_weight[g],
+      nrounds          = nrounds_set[r],
+      Mean_PR_AUC      = mean(pr_m[r, ]),
+      SD_PR_AUC        = sd(pr_m[r, ]),
+      Mean_ROC_AUC     = mean(roc_m[r, ]),
+      SD_ROC_AUC       = sd(roc_m[r, ])
+    )
+  }
+
+  best_here <- max(sapply(tail(results, length(nrounds_set)), function(d) d$Mean_PR_AUC))
+  cat(sprintf("Grid %2d/%d | depth: %d | eta: %.2f | mcw: %d ==> best Mean PR-AUC across rounds: %.4f\n",
+              g, nrow(hyper_grid), hyper_grid$max_depth[g], hyper_grid$eta[g],
+              hyper_grid$min_child_weight[g], best_here))
+}
+
+results_df <- bind_rows(results) %>% arrange(desc(Mean_PR_AUC))
+
+cat("\n=== TOP 10 COMBINATIONS (by mean PR-AUC) ===\n")
+print(head(results_df, 10), digits = 4)
+
+
+```
+
+```{r}
+
+#3. choosing the best parameter values
+#  1-SE simplest model
+# Change to `simple_row` if you want the regularized/simpler model
+use_one_se <- TRUE 
+best_row <- results_df[1, ]
+
+threshold <- best_row$Mean_PR_AUC - best_row$SD_PR_AUC
+simple_row <- results_df %>%
+  filter(Mean_PR_AUC >= threshold) %>%
+  arrange(max_depth, nrounds, desc(min_child_weight), eta) %>%
+  slice(1)
+
+cat("\nBest by mean PR-AUC:\n");        print(best_row, digits = 4)
+cat("\nSimplest within 1 SD of best:\n"); print(simple_row, digits = 4)
+
+chosen <- if (use_one_se) simple_row else best_row
+
+best_params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "logloss",
+  max_depth        = chosen$max_depth,
+  eta              = chosen$eta,
+  min_child_weight = chosen$min_child_weight,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  seed             = 42
+)
+best_nrounds <- chosen$nrounds
+
+cat(sprintf("\nChosen (%s): max_depth=%d, eta=%.2f, min_child_weight=%d, nrounds=%d\n",
+            ifelse(use_one_se, "1-SE Rule", "Absolute Best"),
+            best_params$max_depth, best_params$eta,
+            best_params$min_child_weight, best_nrounds))
+```
+
+```{r}
+# 1. Train final model on the entire train/val pool
+set.seed(42)
+final_model <- xgb.train(params = best_params, data = dtrain_val,
+                         nrounds = best_nrounds, verbose = 0)
+
+# 2. Predict on the held-out test chromosomes
+test_probs <- predict(final_model, dtest)
+test_preds <- as.integer(test_probs >= 0.50)
+
+# 3. Metrics
+tp <- sum(y_test == 1 & test_preds == 1)
+fp <- sum(y_test == 0 & test_preds == 1)
+fn <- sum(y_test == 1 & test_preds == 0)
+tn <- sum(y_test == 0 & test_preds == 0)
+
+test_roc_auc <- as.numeric(auc(roc(y_test, test_probs, levels = c(0, 1),
+                                   direction = "<", quiet = TRUE)))
+test_pr_auc  <- pr.curve(scores.class0 = test_probs[y_test == 1],
+                         scores.class1 = test_probs[y_test == 0])$auc.integral
+
+test_precision <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+test_recall    <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+# 4. Print results
+cat("====================================================\n")
+cat(sprintf("=== HOLDOUT TEST SET PERFORMANCE (N = %d sites) ===\n", length(y_test)))
+cat("====================================================\n")
+cat(sprintf("ROC-AUC   : %.4f\n", test_roc_auc))
+cat(sprintf("PR-AUC    : %.4f  (baseline %.3f)\n", test_pr_auc, mean(y_test)))
+cat(sprintf("Precision : %.4f\n", test_precision))
+cat(sprintf("Recall    : %.4f\n", test_recall))
+cat("====================================================\n")
+print(table(Predicted = test_preds, Actual = y_test))
+```
+
+
+```{r}
+# Calculate feature importance matrix from the final model
+importance_matrix <- xgb.importance(model = final_model)
+
+
+imp_plot <- importance_matrix %>%
+  slice_max(Gain, n = 12) %>%
+  mutate(rel_gain = Gain / max(Gain)) %>%
+  ggplot(aes(x = rel_gain, y = reorder(Feature, rel_gain))) +
+  geom_col(fill = "#2b7bb9", width = 0.35) +
+  labs(x = "Relative importance (gain)", y = NULL, title = "Model 2") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
+imp_plot
+ggsave("importance_model2.pdf", imp_plot, width = 4.5, height = 3.5)
+```
+```{r}
+ids <- fread("test_ids_fixed.csv")
+stopifnot(nrow(ids) == length(test_probs))
+pred_out <- ids %>% mutate(label = y_test, prob = test_probs, pred = test_preds,
+  group = case_when(label == 1 & pred == 1 ~ "TP", label == 0 & pred == 0 ~ "TN",
+                    label == 0 & pred == 1 ~ "FP", label == 1 & pred == 0 ~ "FN"))
+write_tsv(pred_out, "test_predictions_model2.tsv")
+table(pred_out$group)   # should match the confusion matrix
+
+# per-site contributions: which features pushed each prediction up or down (SHAP values)
+contrib <- predict(final_model, dtest, predcontrib = TRUE)
+write_tsv(bind_cols(ids, as_tibble(contrib)), "test_contributions_model2.tsv")
+```
+

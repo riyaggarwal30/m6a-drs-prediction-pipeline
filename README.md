@@ -20,7 +20,7 @@ To ensure compatibility with standard reference annotations and GLORI coordinate
 All data processing, coordinate harmonization, feature engineering, and matrix exports are consolidated into two sequential Jupyter notebooks located in the scripts/ directory:
 
 
-### 1. Training Set Pipeline (`notebooks/01_build_train_set.ipynb`)
+### 1. Training Set Pipeline (`scripts/01_build_train_set.ipynb`)
 
 This notebook executes the complete end-to-end training data preparation workflow:
 
@@ -30,7 +30,7 @@ This notebook executes the complete end-to-end training data preparation workflo
 - **Feature Extraction & Aggregation:** Merges per-read modification probability statistics (`mod_prob_median`, `sd`, `q25`, `q75`) and Phred base quality scores (`base_qual_q25`, `q50`, `q75`) grouped by genomic locus.
 - **Multi-Model Export:** Generates and exports the clean training matrices for all three feature ablation configurations (Model 1: QC/Sequence only; Model 2: Probabilities baseline; Model 3: Comprehensive feature set excluding modified fraction).
 
-### 2. Test Set Pipeline (`notebooks/02_build_test_set.ipynb`)
+### 2. Test Set Pipeline (`scripts/02_build_test_set.ipynb`)
 
 This notebook mirrors the preprocessing and feature extraction workflow of the training pipeline but is tailored for rigorous, uncompromised model evaluation:
 
