@@ -1,0 +1,303 @@
+---
+title: "Error analysis: which sites does the model get wrong?"
+output: html_document
+date: "2026-10-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+```{r load}
+library(tidyverse)
+library(patchwork)
+library(data.table)
+library(pROC)
+library(PRROC)
+
+MODEL <- 2      # 2 = Dorado probabilities only (main analysis); set to 3 to repeat for Model 3
+
+# Colours: correct predictions grey, errors purple (distinct from the blue/orange class colours)
+OUT_COLS <- c(Correct = "#a6a6a6", Error = "#7b3294")
+CLASS_COLS <- c("GLORI m6A" = "#2b7bb9", "GLORI unmodified" = "#d9603b")
+GROUP_LEVELS <- c("TP", "FN", "TN", "FP")
+
+# ---- model predictions (written by the model script) ----
+pred <- fread(sprintf("test_predictions_model%d.tsv", MODEL)) %>%
+  as_tibble() %>% mutate(start = as.integer(start))
+
+# ---- test features, including ones the model did not use ----
+feat <- fread("final_test_feature_matrix_fixed.tsv") %>% as_tibble() %>%
+  mutate(start = as.integer(start)) %>%
+  select(chrom, start, strand,
+         any_of(c("coverage", "modified_percent", "mod_prob_median", "mod_prob_q25",
+                  "mod_prob_q75", "mod_prob_sd", "base_qual_q25", "base_qual_q50",
+                  "base_qual_q75", "kmer_5mer")))
+
+# ---- GLORI annotations: methylation level and transcript region ----
+read_glori <- function(path) {
+  g <- fread(path)
+  if ("seqnames" %in% names(g)) setnames(g, "seqnames", "chrom")
+  as_tibble(g)
+}
+gpos <- read_glori("same_transcript_positives.csv")
+gneg <- read_glori("GLORI_HEK293T_all_negatives_gt100_compact.csv")
+
+pos_ann <- gpos %>% transmute(chrom, start = as.integer(start), strand,
+  glori_ratio = Ratio_mean,
+  region = if ("feature" %in% names(gpos)) as.character(feature) else NA_character_)
+neg_ann <- gneg %>% transmute(chrom, start = as.integer(start), strand,
+  glori_ratio = rowMeans(cbind(Ratio_rep1, Ratio_rep2), na.rm = TRUE),
+  region = if ("feature" %in% names(gneg)) as.character(feature) else NA_character_)
+ann <- bind_rows(pos_ann, neg_ann) %>% distinct(chrom, start, strand, .keep_all = TRUE)
+
+# ---- merge everything ----
+df <- pred %>%
+  left_join(feat, by = c("chrom", "start", "strand")) %>%
+  left_join(ann,  by = c("chrom", "start", "strand")) %>%
+  mutate(class   = if_else(label == 1, "GLORI m6A", "GLORI unmodified"),
+         outcome = if_else(group %in% c("TP", "TN"), "Correct", "Error"),
+         group   = factor(group, levels = GROUP_LEVELS))
+
+# checks: nothing lost, nothing unmatched
+stopifnot(nrow(df) == nrow(pred))
+cat("Sites:", nrow(df), "\n")
+print(table(df$group))
+cat("Missing features:", sum(is.na(df$coverage)),
+    "| missing GLORI level:", sum(is.na(df$glori_ratio)), "\n")
+
+write_tsv(df, sprintf("error_analysis_table_model%d.tsv", MODEL))
+```
+
+## 1. Where do the errors sit on the probability scale?
+
+```{r prob-dist, fig.width=9, fig.height=3.8}
+p_prob <- ggplot(df, aes(x = prob, fill = outcome)) +
+  geom_histogram(bins = 50, boundary = 0, colour = NA) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey30") +
+  facet_wrap(~ class, scales = "free_y") +
+  scale_y_sqrt() +
+  scale_fill_manual(values = OUT_COLS, name = NULL) +
+  labs(x = "Predicted probability of m6A", y = "Number of sites (square-root scale)",
+       title = sprintf("Model %d: predicted probabilities by GLORI class", MODEL)) +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom")
+p_prob
+ggsave(sprintf("err_prob_distribution_model%d.pdf", MODEL), p_prob, width = 9, height = 3.8)
+```
+
+## 2. GLORI methylation level vs DRS modified fraction
+
+False negatives at low GLORI levels = Dorado misses weakly methylated sites.
+False negatives at high GLORI levels = genuine Dorado failures worth inspecting.
+
+```{r glori-vs-drs, fig.width=10, fig.height=4.5}
+p_scatter <- df %>% arrange(outcome) %>%            # draw errors on top
+  ggplot(aes(x = 100 * glori_ratio, y = modified_percent, colour = outcome)) +
+  geom_point(size = 0.8, alpha = 0.7) +
+  facet_wrap(~ class, scales = "free_x") +
+  scale_colour_manual(values = OUT_COLS, name = NULL) +
+  labs(x = "GLORI methylation level (%)", y = "DRS modified fraction (%, modkit)",
+       title = "Agreement between GLORI and DRS methylation levels") +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom")
+p_scatter
+ggsave(sprintf("err_glori_vs_drs_model%d.pdf", MODEL), p_scatter, width = 10, height = 4.5)
+
+# GLORI level of missed vs found positives
+df %>% filter(class == "GLORI m6A") %>% group_by(group) %>%
+  summarise(n = n(), median_glori_pct = 100 * median(glori_ratio, na.rm = TRUE),
+            share_below_20pct = mean(glori_ratio < 0.20, na.rm = TRUE))
+```
+
+## 3. Error rate per 5-mer
+
+Only 5-mers with at least 30 sites in a class. Stars mark 5-mers whose error rate differs
+from the rest of that class (Fisher's exact test, BH-adjusted p < 0.05).
+
+```{r kmer, fig.width=10, fig.height=6}
+kmer_err <- df %>%
+  group_by(class, kmer_5mer) %>%
+  summarise(n = n(), n_err = sum(outcome == "Error"), .groups = "drop") %>%
+  group_by(class) %>%
+  mutate(tot = sum(n), tot_err = sum(n_err)) %>%
+  ungroup() %>%
+  filter(n >= 30) %>%
+  rowwise() %>%
+  mutate(p = fisher.test(matrix(c(n_err, n - n_err,
+                                  tot_err - n_err, (tot - n) - (tot_err - n_err)),
+                                nrow = 2))$p.value) %>%
+  ungroup() %>%
+  group_by(class) %>%
+  mutate(p_adj = p.adjust(p, method = "BH"),
+         rate = n_err / n, overall = tot_err / tot) %>%
+  ungroup() %>%
+  mutate(key = paste(kmer_5mer, class, sep = "__"),
+         key = fct_reorder(key, rate),
+         lab = paste0("n=", n, if_else(p_adj < 0.05, " *", "")))
+
+p_kmer <- ggplot(kmer_err, aes(x = 100 * rate, y = key)) +
+  geom_col(fill = OUT_COLS["Error"], width = 0.75) +
+  geom_vline(aes(xintercept = 100 * overall), linetype = "dashed", colour = "grey30") +
+  geom_text(aes(label = lab), hjust = -0.1, size = 2.8) +
+  facet_wrap(~ class, scales = "free",
+             labeller = as_labeller(c("GLORI m6A" = "False-negative rate (GLORI m6A sites)",
+                                      "GLORI unmodified" = "False-positive rate (GLORI unmodified sites)"))) +
+  scale_y_discrete(labels = function(x) sub("__.*", "", x)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.3))) +
+  labs(x = "Error rate (%)", y = "5-mer context",
+       title = "Error rate by sequence context (dashed line = overall rate)") +
+  theme_bw(base_size = 11)
+p_kmer
+ggsave(sprintf("err_kmer_model%d.pdf", MODEL), p_kmer, width = 10, height = 6)
+
+kmer_err %>% filter(p_adj < 0.05) %>%
+  select(class, kmer_5mer, n, n_err, rate, overall, p_adj) %>% arrange(class, p_adj)
+```
+
+## 4. Error rate by coverage
+
+```{r coverage, fig.width=8, fig.height=3.8}
+cov_err <- df %>%
+  mutate(cov_bin = cut(coverage, breaks = c(10, 20, 50, 100, Inf), right = FALSE,
+                       labels = c("10–19", "20–49", "50–99", "≥100"))) %>%
+  group_by(class, cov_bin) %>%
+  summarise(n = n(), rate = mean(outcome == "Error"), .groups = "drop")
+
+p_cov <- ggplot(cov_err, aes(x = cov_bin, y = 100 * rate, fill = class)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  geom_text(aes(label = paste0("n=", n)), position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 2.8) +
+  scale_fill_manual(values = CLASS_COLS, name = NULL,
+                    labels = c("False-negative rate (m6A)", "False-positive rate (unmodified)")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "DRS read coverage", y = "Error rate (%)", title = "Error rate by read coverage") +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom")
+p_cov
+ggsave(sprintf("err_coverage_model%d.pdf", MODEL), p_cov, width = 8, height = 3.8)
+```
+
+## 5. Feature distributions: errors vs correct predictions
+
+```{r boxplots, fig.width=11, fig.height=6}
+long <- df %>%
+  transmute(group, class,
+            `log10 coverage`             = log10(coverage),
+            `Median base quality`        = base_qual_q50,
+            `SD of m6A probability`      = mod_prob_sd,
+            `Median m6A probability`     = mod_prob_median,
+            `DRS modified fraction (%)`  = modified_percent,
+            `GLORI methylation (%)`      = 100 * glori_ratio) %>%
+  pivot_longer(-c(group, class), names_to = "feature", values_to = "value")
+
+p_box <- ggplot(long, aes(x = group, y = value, fill = group)) +
+  geom_boxplot(outlier.size = 0.4, width = 0.7) +
+  facet_wrap(~ feature, scales = "free_y", nrow = 2) +
+  scale_fill_manual(values = c(TP = "#2b7bb9", FN = "#9ecae1", TN = "#d9603b", FP = "#fdae6b"),
+                    name = NULL) +
+  labs(x = NULL, y = NULL, title = "Features of correct and incorrect predictions") +
+  theme_bw(base_size = 11) + theme(legend.position = "none")
+p_box
+ggsave(sprintf("err_boxplots_model%d.pdf", MODEL), p_box, width = 11, height = 6)
+
+# Wilcoxon tests: FN vs TP and FP vs TN
+wilcox_tab <- long %>%
+  mutate(comparison = case_when(group %in% c("TP", "FN") ~ "FN vs TP",
+                                group %in% c("TN", "FP") ~ "FP vs TN")) %>%
+  group_by(comparison, feature) %>%
+  summarise(
+    median_correct = median(value[group %in% c("TP", "TN")], na.rm = TRUE),
+    median_error   = median(value[group %in% c("FN", "FP")], na.rm = TRUE),
+    p = tryCatch(wilcox.test(value[group %in% c("FN", "FP")],
+                             value[group %in% c("TP", "TN")])$p.value,
+                 error = function(e) NA_real_),
+    .groups = "drop") %>%
+  mutate(p_adj = p.adjust(p, method = "BH"))
+print(wilcox_tab, n = Inf)
+write_tsv(wilcox_tab, sprintf("err_wilcoxon_model%d.tsv", MODEL))
+```
+
+## 6. Error rate by transcript region (if annotated)
+
+```{r region, fig.width=8, fig.height=3.8}
+if (any(!is.na(df$region))) {
+  reg_err <- df %>% filter(!is.na(region)) %>%
+    group_by(class, region) %>%
+    summarise(n = n(), rate = mean(outcome == "Error"), .groups = "drop") %>%
+    filter(n >= 30)
+  p_reg <- ggplot(reg_err, aes(x = region, y = 100 * rate, fill = class)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+    geom_text(aes(label = paste0("n=", n)), position = position_dodge(width = 0.8),
+              vjust = -0.4, size = 2.8) +
+    scale_fill_manual(values = CLASS_COLS, name = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(x = "Transcript region", y = "Error rate (%)", title = "Error rate by transcript region") +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom")
+  print(p_reg)
+  ggsave(sprintf("err_region_model%d.pdf", MODEL), p_reg, width = 8, height = 3.8)
+} else cat("No region annotation available.\n")
+```
+
+## 7. Which features pushed the errors the wrong way? (SHAP)
+
+Mean per-site contribution (log-odds) of each feature, per prediction group.
+Negative = pushed towards "unmodified", positive = towards "m6A".
+
+```{r shap, fig.width=9, fig.height=4}
+contrib <- fread(sprintf("test_contributions_model%d.tsv", MODEL)) %>% as_tibble() %>%
+  mutate(start = as.integer(start))
+feat_cols <- setdiff(names(contrib), c("chrom", "start", "end", "strand", "BIAS", "(Intercept)"))
+
+shap_mean <- contrib %>%
+  inner_join(df %>% select(chrom, start, strand, group), by = c("chrom", "start", "strand")) %>%
+  pivot_longer(all_of(feat_cols), names_to = "feature", values_to = "contribution") %>%
+  group_by(group, feature) %>%
+  summarise(mean_contrib = mean(contribution), .groups = "drop") %>%
+  group_by(feature) %>% filter(max(abs(mean_contrib)) > 0.05) %>% ungroup()
+
+p_shap <- ggplot(shap_mean, aes(x = mean_contrib, y = fct_reorder(feature, abs(mean_contrib), max),
+                                fill = group)) +
+  geom_col(position = position_dodge(width = 0.85), width = 0.8) +
+  geom_vline(xintercept = 0, colour = "grey30") +
+  scale_fill_manual(values = c(TP = "#2b7bb9", FN = "#9ecae1", TN = "#d9603b", FP = "#fdae6b"),
+                    name = NULL) +
+  labs(x = "Mean contribution to prediction (log-odds)", y = NULL,
+       title = sprintf("Model %d: feature contributions by prediction group", MODEL)) +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom")
+p_shap
+ggsave(sprintf("err_shap_model%d.pdf", MODEL), p_shap, width = 9, height = 4)
+```
+
+## 8. ROC and precision-recall curves for all models
+
+Uses every `test_predictions_model*.tsv` file that exists.
+
+```{r curves, fig.width=10, fig.height=4.5}
+files <- list.files(pattern = "^test_predictions_model[0-9]\\.tsv$")
+curves_roc <- list(); curves_pr <- list()
+for (f in files) {
+  m <- paste("Model", sub("\\D*(\\d).*", "\\1", f))
+  d <- fread(f)
+  r <- roc(d$label, d$prob, levels = c(0, 1), direction = "<", quiet = TRUE)
+  curves_roc[[m]] <- tibble(model = sprintf("%s (AUC %.3f)", m, auc(r)),
+                            fpr = 1 - r$specificities, tpr = r$sensitivities)
+  pr <- pr.curve(scores.class0 = d$prob[d$label == 1], scores.class1 = d$prob[d$label == 0],
+                 curve = TRUE)
+  curves_pr[[m]] <- tibble(model = sprintf("%s (AUC %.3f)", m, pr$auc.integral),
+                           recall = pr$curve[, 1], precision = pr$curve[, 2])
+}
+baseline <- mean(fread(files[1])$label)
+
+p_roc <- ggplot(bind_rows(curves_roc), aes(fpr, tpr, colour = model)) +
+  geom_abline(linetype = "dotted", colour = "grey50") + geom_path(linewidth = 0.8) +
+  labs(x = "False positive rate", y = "True positive rate", title = "ROC curves", colour = NULL)
+p_pr <- ggplot(bind_rows(curves_pr), aes(recall, precision, colour = model)) +
+  geom_hline(yintercept = baseline, linetype = "dotted", colour = "grey50") +
+  geom_path(linewidth = 0.8) +
+  labs(x = "Recall", y = "Precision", title = "Precision-recall curves", colour = NULL)
+
+p_curves <- (p_roc | p_pr) &
+  scale_colour_manual(values = c("#555555", "#2b7bb9", "#7b3294")) &
+  coord_equal() & theme_bw(base_size = 11) & theme(legend.position = "bottom", legend.direction = "vertical")
+p_curves
+ggsave("roc_pr_curves.pdf", p_curves, width = 10, height = 5)
+```
